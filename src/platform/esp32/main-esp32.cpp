@@ -250,9 +250,12 @@ void cpuDeepSleep(uint32_t msecToWake)
 #endif // #end ESP32S3_WAKE_TYPE
 #endif
 
-    // We want RTC peripherals to stay on
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
-
-    esp_sleep_enable_timer_wakeup(msecToWake * 1000ULL); // call expects usecs
+    if (msecToWake < portMAX_DELAY) {
+        // We want RTC peripherals to stay on
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+        esp_sleep_enable_timer_wakeup(msecToWake * 1000ULL); // call expects usecs
+    } else {
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+    }
     esp_deep_sleep_start();                              // TBD mA sleep current (battery)
 }

@@ -276,7 +276,11 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight = false, bool skipSaveN
 #endif
 
 #if defined(VEXT_ENABLE)
+#ifdef HELTEC_V3
+    pinMode(VEXT_ENABLE, INPUT); // turn on the display power
+#else
     digitalWrite(VEXT_ENABLE, !VEXT_ON_VALUE); // turn on the display power
+#endif
 #endif
 
 #ifdef ARCH_ESP32
