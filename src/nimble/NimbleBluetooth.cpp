@@ -41,7 +41,16 @@ constexpr uint16_t kPreferredBleTxTimeUs = (kPreferredBleTxOctets + 14) * 8;
 // #define DEBUG_NIMBLE_ON_WRITE_TIMING // uncomment to time onWrite duration
 // #define DEBUG_NIMBLE_NOTIFY          // uncomment to enable notify logging
 
+#ifndef NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE
+#if defined(ARCH_ESP32)
+#ifndef NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE_ESP32
+#define NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE_ESP32 16
+#endif
+#define NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE_ESP32
+#else
 #define NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE 3
+#endif
+#endif
 #define NIMBLE_BLUETOOTH_FROM_PHONE_QUEUE_SIZE 3
 
 NimBLECharacteristic *fromNumCharacteristic;
@@ -155,6 +164,17 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     std::atomic<int32_t> readCount{0};
     std::atomic<int32_t> notifyCount{0};
     std::atomic<int32_t> writeCount{0};
+    std::atomic<uint32_t> toPhoneQueueFullEventCount{0};
+    size_t toPhoneQueueMaxObserved = 0;
+
+    void noteToPhoneQueueOccupancy(size_t queueSize)
+    {
+        if (queueSize > toPhoneQueueMaxObserved) {
+            toPhoneQueueMaxObserved = queueSize;
+            LOG_DEBUG("BLE toPhoneQueue high-water mark=%u/%u", static_cast<unsigned int>(queueSize),
+                      NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE);
+        }
+    }
 
   protected:
     virtual int32_t runOnce() override
@@ -267,20 +287,25 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
                     // Note: the comparison above is safe without a mutex because we are the only method that *increases*
                     // toPhoneQueueSize. (It's okay if toPhoneQueueSize *decreases* in the NimBLE task meanwhile.)
 
+                    size_t queueSizeAfterPush = 0;
                     { // scope for toPhoneMutex mutex
                         std::lock_guard<std::mutex> guard(toPhoneMutex);
                         size_t storeAtIndex = toPhoneQueueSize.load();
                         memcpy(toPhoneQueue[storeAtIndex].data(), fromRadioBytes, numBytes);
                         toPhoneQueueByteSizes[storeAtIndex] = numBytes;
                         toPhoneQueueSize++;
+                        queueSizeAfterPush = toPhoneQueueSize.load();
                     }
+                    noteToPhoneQueueOccupancy(queueSizeAfterPush);
 #ifdef DEBUG_NIMBLE_ON_READ_TIMING
                     LOG_DEBUG("BLE getFromRadio returned numBytes=%u, pushed toPhoneQueueSize=%u", numBytes,
                               toPhoneQueueSize.load());
 #endif
                 } else {
-                    // Shouldn't happen because the onRead callback shouldn't be waiting if the queue is full!
-                    LOG_ERROR("Shouldn't happen! Drop FromRadio packet, toPhoneQueue full (%u bytes)", numBytes);
+                    const uint32_t fullEvents = ++toPhoneQueueFullEventCount;
+                    LOG_ERROR("Drop FromRadio packet, toPhoneQueue full (%u bytes), fullEvents=%u current=%u max=%u", numBytes,
+                              fullEvents, static_cast<unsigned int>(toPhoneQueueSize.load()),
+                              static_cast<unsigned int>(toPhoneQueueMaxObserved));
                 }
             }
 

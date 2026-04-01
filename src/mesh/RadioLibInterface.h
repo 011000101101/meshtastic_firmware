@@ -82,7 +82,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      * this code for a long time.
      */
     const uint8_t syncWordMeshtastic = 0x2b;
-    const uint8_t qsyncWordPrivate = 0x12;  // Spreading Factors below SF7 can not encode large sync words -> use private sync word.
+    const uint8_t syncWordPrivate = 0x12;  // Spreading Factors below SF7 can not encode large sync words -> use private sync word.
     uint8_t syncWord(const uint8_t sf) const {
         if (sf >= 7) {
             return syncWordMeshtastic;

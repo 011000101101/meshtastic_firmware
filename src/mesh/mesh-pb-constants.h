@@ -16,7 +16,10 @@
 // RAM #define MAX_RX_TOPHONE (member_size(DeviceState, receive_queue) / member_size(DeviceState, receive_queue[0]))
 #ifndef MAX_RX_TOPHONE
 #if defined(ARCH_ESP32) && !(defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3))
-#define MAX_RX_TOPHONE 8
+#ifndef MAX_RX_TOPHONE_ESP32
+#define MAX_RX_TOPHONE_ESP32 32
+#endif
+#define MAX_RX_TOPHONE MAX_RX_TOPHONE_ESP32
 #else
 #define MAX_RX_TOPHONE 32
 #endif

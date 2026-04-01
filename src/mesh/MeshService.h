@@ -78,6 +78,12 @@ class MeshService
     /// Updated in loop() to detect when fromNum changes
     uint32_t oldFromNum = 0;
 
+    uint32_t toPhoneQueueDropCount = 0;
+    uint32_t toPhoneQueueDropOldestCount = 0;
+    int toPhoneQueueMaxObserved = 0;
+
+    void noteToPhoneQueueOccupancy();
+
   public:
     enum APIState {
         STATE_DISCONNECTED, // Initial state, no API is connected

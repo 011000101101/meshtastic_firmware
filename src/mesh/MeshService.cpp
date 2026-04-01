@@ -74,6 +74,15 @@ MeshService::MeshService()
     lastQueueStatus = {0, 0, 16, 0};
 }
 
+void MeshService::noteToPhoneQueueOccupancy()
+{
+    const int used = toPhoneQueue.numUsed();
+    if (used > toPhoneQueueMaxObserved) {
+        toPhoneQueueMaxObserved = used;
+        LOG_DEBUG("MeshService toPhoneQueue high-water mark=%d/%d", used, MAX_RX_TOPHONE);
+    }
+}
+
 void MeshService::init()
 {
 #if HAS_GPS
@@ -316,15 +325,23 @@ void MeshService::sendToPhone(meshtastic_MeshPacket *p)
 #endif
 #endif
 
+    noteToPhoneQueueOccupancy();
+
     if (toPhoneQueue.numFree() == 0) {
         if (p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP ||
             p->decoded.portnum == meshtastic_PortNum_RANGE_TEST_APP) {
-            LOG_WARN("ToPhone queue is full, discard oldest");
+            toPhoneQueueDropCount++;
+            toPhoneQueueDropOldestCount++;
+            LOG_WARN("ToPhone queue is full, discard oldest. drops=%u dropOldest=%u current=%d max=%d port=%d",
+                     toPhoneQueueDropCount, toPhoneQueueDropOldestCount, toPhoneQueue.numUsed(), toPhoneQueueMaxObserved,
+                     p->decoded.portnum);
             meshtastic_MeshPacket *d = toPhoneQueue.dequeuePtr(0);
             if (d)
                 releaseToPool(d);
         } else {
-            LOG_WARN("ToPhone queue is full, drop packet");
+            toPhoneQueueDropCount++;
+            LOG_WARN("ToPhone queue is full, drop packet. drops=%u current=%d max=%d port=%d", toPhoneQueueDropCount,
+                     toPhoneQueue.numUsed(), toPhoneQueueMaxObserved, p->decoded.portnum);
             releaseToPool(p);
             fromNum++; // Make sure to notify observers in case they are reconnected so they can get the packets
             return;
@@ -335,6 +352,7 @@ void MeshService::sendToPhone(meshtastic_MeshPacket *p)
         LOG_CRIT("Failed to queue a packet into toPhoneQueue!");
         abort();
     }
+    noteToPhoneQueueOccupancy();
     fromNum++;
 }
 
