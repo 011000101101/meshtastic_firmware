@@ -81,7 +81,14 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      * We now use 0x2b (so that someday we can possibly use NOT 2b - because that would be funny pun).  We will be staying with
      * this code for a long time.
      */
-    const uint8_t syncWord = 0x2b;
+    const uint8_t syncWordMeshtastic = 0x2b;
+    const uint8_t qsyncWordPrivate = 0x12;  // Spreading Factors below SF7 can not encode large sync words -> use private sync word.
+    uint8_t syncWord(const uint8_t sf) const {
+        if (sf >= 7) {
+            return syncWordMeshtastic;
+        }
+        return syncWordPrivate;
+    }
 
     float currentLimit = 100; // 100mA OCP - Should be acceptable for RFM95/SX127x chipset.
 

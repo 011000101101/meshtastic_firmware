@@ -66,7 +66,7 @@ template <typename T> bool SX128xInterface<T>::init()
 
     preambleLength = 12; // 12 is the default for this chip, 32 does not RX at all
 
-    int res = lora.begin(getFreq(), bw, sf, cr, syncWord, power, preambleLength);
+    int res = lora.begin(getFreq(), bw, sf, cr, syncWord(sf), power, preambleLength);
     // \todo Display actual typename of the adapter, not just `SX128x`
     LOG_INFO("SX128x init result %d", res);
     if (res == RADIOLIB_ERR_CHIP_NOT_FOUND || res == RADIOLIB_ERR_SPI_CMD_FAILED)
@@ -130,7 +130,7 @@ template <typename T> bool SX128xInterface<T>::reconfigure()
     if (err != RADIOLIB_ERR_NONE)
         RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_INVALID_RADIO_SETTING);
 
-    err = lora.setSyncWord(syncWord);
+    err = lora.setSyncWord(syncWord(sf));
     if (err != RADIOLIB_ERR_NONE)
         LOG_ERROR("SX128X setSyncWord %s%d", radioLibErr, err);
     assert(err == RADIOLIB_ERR_NONE);

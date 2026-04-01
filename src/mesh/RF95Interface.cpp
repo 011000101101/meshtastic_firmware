@@ -175,7 +175,7 @@ bool RF95Interface::init()
 #endif
     setTransmitEnable(false);
 
-    int res = lora->begin(getFreq(), bw, sf, cr, syncWord, power, preambleLength);
+    int res = lora->begin(getFreq(), bw, sf, cr, syncWord(sf), power, preambleLength);
     LOG_INFO("RF95 init result %d", res);
     if (res == RADIOLIB_ERR_CHIP_NOT_FOUND || res == RADIOLIB_ERR_SPI_CMD_FAILED)
         return false;
@@ -221,7 +221,7 @@ bool RF95Interface::reconfigure()
     if (err != RADIOLIB_ERR_NONE)
         RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_INVALID_RADIO_SETTING);
 
-    err = lora->setSyncWord(syncWord);
+    err = lora->setSyncWord(syncWord(sf));
     if (err != RADIOLIB_ERR_NONE)
         LOG_ERROR("RF95 setSyncWord %s%d", radioLibErr, err);
     assert(err == RADIOLIB_ERR_NONE);

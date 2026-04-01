@@ -25,7 +25,7 @@ extern const RegionInfo *myRegion;
 extern void initRegion();
 
 // Valid LoRa spread factor range and defaults
-constexpr uint8_t LORA_SF_MIN = 7;
+constexpr uint8_t LORA_SF_MIN = 5;
 constexpr uint8_t LORA_SF_MAX = 12;
 constexpr uint8_t LORA_SF_DEFAULT = 11; // LONG_FAST default
 

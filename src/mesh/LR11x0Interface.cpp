@@ -94,13 +94,13 @@ template <typename T> bool LR11x0Interface<T>::init()
     // Allow extra time for TCXO to stabilize after power-on
     delay(10);
 
-    int res = lora.begin(getFreq(), bw, sf, cr, syncWord, power, preambleLength, tcxoVoltage);
+    int res = lora.begin(getFreq(), bw, sf, cr, syncWord(sf), power, preambleLength, tcxoVoltage);
 
     // Retry if we get SPI command failed - some units need extra TCXO stabilization time
     if (res == RADIOLIB_ERR_SPI_CMD_FAILED) {
         LOG_WARN("LR11x0 init failed with %d (SPI_CMD_FAILED), retrying after delay...", res);
         delay(100);
-        res = lora.begin(getFreq(), bw, sf, cr, syncWord, power, preambleLength, tcxoVoltage);
+        res = lora.begin(getFreq(), bw, sf, cr, syncWord(sf), power, preambleLength, tcxoVoltage);
     }
 
     // \todo Display actual typename of the adapter, not just `LR11x0`
@@ -174,7 +174,7 @@ template <typename T> bool LR11x0Interface<T>::reconfigure()
     if (err != RADIOLIB_ERR_NONE)
         RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_INVALID_RADIO_SETTING);
 
-    err = lora.setSyncWord(syncWord);
+    err = lora.setSyncWord(syncWord(sf));
     assert(err == RADIOLIB_ERR_NONE);
 
     err = lora.setPreambleLength(preambleLength);

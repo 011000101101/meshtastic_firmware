@@ -91,7 +91,7 @@ template <typename T> bool SX126xInterface<T>::init()
     if (power < -9)
         power = -9;
 
-    int res = lora.begin(getFreq(), bw, sf, cr, syncWord, power, preambleLength, tcxoVoltage, useRegulatorLDO);
+    int res = lora.begin(getFreq(), bw, sf, cr, syncWord(sf), power, preambleLength, tcxoVoltage, useRegulatorLDO);
 
 #ifdef SX126X_PA_RAMP_US
     // Set custom PA ramp time for boards requiring longer stabilization (e.g., T-Beam 1W needs >800us)
@@ -226,7 +226,7 @@ template <typename T> bool SX126xInterface<T>::reconfigure()
     if (err != RADIOLIB_ERR_NONE)
         RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_INVALID_RADIO_SETTING);
 
-    err = lora.setSyncWord(syncWord);
+    err = lora.setSyncWord(syncWord(sf));
     if (err != RADIOLIB_ERR_NONE)
         LOG_ERROR("SX126X setSyncWord %s%d", radioLibErr, err);
     assert(err == RADIOLIB_ERR_NONE);
