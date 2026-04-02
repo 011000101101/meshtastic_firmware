@@ -137,6 +137,7 @@ class PhoneAPI
 
     bool isConnected() { return state != STATE_SEND_NOTHING; }
     bool isSendingPackets() { return state == STATE_SEND_PACKETS; }
+    const char *debugStateName() const;
 
   protected:
     /// Our fromradio packet while it is being assembled

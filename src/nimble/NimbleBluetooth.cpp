@@ -7,7 +7,9 @@
 
 #include "concurrency/OSThread.h"
 #include "main.h"
+#include "mesh/MeshService.h"
 #include "mesh/PhoneAPI.h"
+#include "mesh/Router.h"
 #include "mesh/mesh-pb-constants.h"
 #include "sleep.h"
 #include <NimBLEDevice.h>
@@ -26,15 +28,20 @@
 #include "nimble/nimble/host/include/host/ble_gap.h"
 #endif
 
-#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C6)
+extern "C" void ble_svc_gatt_changed(uint16_t start_handle, uint16_t end_handle);
 
 namespace
 {
+constexpr uint32_t kFromRadioSyncMinSendIntervalMs = 12;
+constexpr uint32_t kFromRadioSyncConfigSendIntervalMs = 35;
+constexpr uint32_t kFromRadioSyncEnomemRetryMs = 30;
+constexpr uint32_t kFromRadioSyncGenericRetryMs = 20;
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C6)
 constexpr uint16_t kPreferredBleMtu = 517;
 constexpr uint16_t kPreferredBleTxOctets = 251;
 constexpr uint16_t kPreferredBleTxTimeUs = (kPreferredBleTxOctets + 14) * 8;
-} // namespace
 #endif
+} // namespace
 
 // Debugging options: careful, they slow things down quite a bit!
 // #define DEBUG_NIMBLE_ON_READ_TIMING  // uncomment to time onRead duration
@@ -54,9 +61,13 @@ constexpr uint16_t kPreferredBleTxTimeUs = (kPreferredBleTxOctets + 14) * 8;
 #define NIMBLE_BLUETOOTH_FROM_PHONE_QUEUE_SIZE 3
 
 NimBLECharacteristic *fromNumCharacteristic;
+NimBLECharacteristic *fromRadioSyncCharacteristic;
 NimBLECharacteristic *BatteryCharacteristic;
 NimBLECharacteristic *logRadioCharacteristic;
 NimBLEServer *bleServer;
+static std::atomic<bool> gattServiceChangedNotified{false};
+static std::atomic<bool> gattRefreshDisconnectPending{false};
+static std::atomic<uint32_t> gattRefreshDisconnectAtMs{0};
 
 static bool passkeyShowing;
 static std::atomic<uint16_t> nimbleBluetoothConnHandle{BLE_HS_CONN_HANDLE_NONE}; // BLE_HS_CONN_HANDLE_NONE means "no connection"
@@ -165,7 +176,20 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     std::atomic<int32_t> notifyCount{0};
     std::atomic<int32_t> writeCount{0};
     std::atomic<uint32_t> toPhoneQueueFullEventCount{0};
+    std::atomic<uint32_t> fromRadioSyncSentCount{0};
+    std::atomic<uint32_t> fromRadioSyncNotifyFailureCount{0};
+    std::atomic<uint32_t> fromRadioSyncRetryCount{0};
+    std::atomic<uint32_t> legacyReadServedCount{0};
+    std::atomic<bool> fromRadioSyncSubscribed{false};
+    std::atomic<bool> fromRadioSyncNotifyInFlight{false};
+    std::atomic<bool> connectionParamsDirty{false};
+    std::mutex fromRadioSyncMutex;
+    std::array<uint8_t, meshtastic_FromRadio_size> fromRadioSyncPending{};
+    size_t fromRadioSyncPendingSize = 0;
+    uint32_t fromRadioSyncSequence = 0;
+    uint32_t fromRadioSyncNextSendMs = 0;
     size_t toPhoneQueueMaxObserved = 0;
+    uint32_t lastStatsLogMs = 0;
 
     void noteToPhoneQueueOccupancy(size_t queueSize)
     {
@@ -176,93 +200,168 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         }
     }
 
-  protected:
-    virtual int32_t runOnce() override
+    bool isFromRadioSyncSubscribed() const { return fromRadioSyncSubscribed.load(); }
+
+    bool isFromRadioSyncActive() { return isFromRadioSyncSubscribed(); }
+
+    bool shouldUseLegacyQueueProducerForSync() { return isFromRadioSyncActive() && !isSendingPackets(); }
+
+    uint32_t getFromRadioSyncSendIntervalMs() { return isSendingPackets() ? kFromRadioSyncMinSendIntervalMs
+                                                                          : kFromRadioSyncConfigSendIntervalMs; }
+
+    bool shouldUseHighThroughputConnection() { return isFromRadioSyncActive() || !isSendingPackets(); }
+
+    bool hasFromRadioSyncPendingPacket()
     {
-        while (runOnceHasWorkToDo()) {
-            /*
-              PROCESS fromPhoneQueue BEFORE toPhoneQueue:
-
-              In normal STATE_SEND_PACKETS operation, it's unlikely that we'll have both writes and reads to process at the same
-              time, because either onWrite or onRead will trigger this runOnce. And in STATE_SEND_PACKETS, it's generally ok to
-              service either the reads or writes first.
-
-              However, during the initial setup wantConfig packet, the clients send a write and immediately send a read, and they
-              expect the read will respond to the write. (This also happens when a client goes from STATE_SEND_PACKETS back to
-              another wantConfig, like the iOS client does when requesting the nodedb after requesting the main config only.)
-
-              So it's safest to always service writes (fromPhoneQueue) before reads (toPhoneQueue), so that any "synchronous"
-              write-then-read sequences from the client work as expected, even if this means we block onRead for a while: this is
-              what the client wants!
-            */
-
-            // PHONE -> RADIO:
-            runOnceHandleFromPhoneQueue(); // pull data from onWrite to handleToRadio
-
-            // RADIO -> PHONE:
-            runOnceHandleToPhoneQueue(); // push data from getFromRadio to onRead
-        }
-
-        // the run is triggered via NimbleBluetoothToRadioCallback and NimbleBluetoothFromRadioCallback
-        return INT32_MAX;
+        std::lock_guard<std::mutex> guard(fromRadioSyncMutex);
+        return fromRadioSyncPendingSize > 0;
     }
 
-    virtual void onConfigStart() override
+    bool isFromRadioSyncReadyToSend()
     {
-        LOG_INFO("BLE onConfigStart");
-
-        // Prefer high throughput during config/setup, at the cost of high power consumption (for a few seconds)
-        if (bleServer && isConnected()) {
-            uint16_t conn_handle = nimbleBluetoothConnHandle.load();
-            if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-                requestHighThroughputConnection(conn_handle);
-            }
-        }
+        std::lock_guard<std::mutex> guard(fromRadioSyncMutex);
+        return millis() >= fromRadioSyncNextSendMs;
     }
 
-    virtual void onConfigComplete() override
+    void setFromRadioSyncNextSendDelay(uint32_t delayMs)
     {
-        LOG_INFO("BLE onConfigComplete");
-
-        // Switch to lower power consumption BLE connection params for steady-state use after config/setup is complete
-        if (bleServer && isConnected()) {
-            uint16_t conn_handle = nimbleBluetoothConnHandle.load();
-            if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-                requestLowerPowerConnection(conn_handle);
-            }
-        }
+        std::lock_guard<std::mutex> guard(fromRadioSyncMutex);
+        fromRadioSyncNextSendMs = millis() + delayMs;
     }
 
-    bool runOnceHasWorkToDo() { return runOnceHasWorkToPhone() || runOnceHasWorkFromPhone(); }
-
-    bool runOnceHasWorkToPhone() { return onReadCallbackIsWaitingForData || runOnceToPhoneCanPreloadNextPacket(); }
-
-    bool runOnceToPhoneCanPreloadNextPacket()
+    void markConnectionParamsDirty()
     {
-        /*
-         * PRELOADING getFromRadio RESPONSES:
-         *
-         * It's not safe to preload packets if we're in STATE_SEND_PACKETS, because there may be a while between the time we call
-         * getFromRadio and when the client actually reads it. If the connection drops in that time, we might lose that packet
-         * forever. In STATE_SEND_PACKETS, if we wait for onRead before we call getFromRadio, we minimize the time window where
-         * the client might disconnect before completing the read.
-         *
-         * However, if we're in the setup states (sending config, nodeinfo, etc), it's safe and beneficial to preload packets into
-         * toPhoneQueue because the client will just reconnect after a disconnect, losing nothing.
-         */
+        connectionParamsDirty = true;
+        setIntervalFromNow(0);
+        concurrency::mainDelay.interrupt();
+    }
 
-        if (!isConnected()) {
-            return false;
-        } else if (isSendingPackets()) {
-            // If we're in STATE_SEND_PACKETS, we must wait for onRead before calling getFromRadio.
-            return false;
+    void applyConnectionParamsIfNeeded()
+    {
+        if (!connectionParamsDirty.exchange(false)) {
+            return;
+        }
+        if (!bleServer || !isConnected()) {
+            return;
+        }
+
+        const uint16_t conn_handle = nimbleBluetoothConnHandle.load();
+        if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            return;
+        }
+
+        if (shouldUseHighThroughputConnection()) {
+            requestHighThroughputConnection(conn_handle);
         } else {
-            // In other states, we can preload as long as there's space in the toPhoneQueue.
-            return toPhoneQueueSize < NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE;
+            requestLowerPowerConnection(conn_handle);
         }
     }
 
-    void runOnceHandleToPhoneQueue()
+    void maybeLogDeliveryStats(bool force = false)
+    {
+        const uint32_t now = millis();
+        if (!force && now - lastStatsLogMs < 2000) {
+            return;
+        }
+        lastStatsLogMs = now;
+
+        LOG_INFO(
+            "BLE delivery stats: syncSub=%d syncInflight=%d syncPending=%u syncSent=%u syncRetries=%u syncFailures=%u "
+            "legacyReads=%u meshQ=%d/%d drops=%u bleQ=%u/%u full=%u "
+            "fromRadioQDrops=%u",
+            isFromRadioSyncActive(), fromRadioSyncNotifyInFlight.load(), hasFromRadioSyncPendingPacket(),
+            fromRadioSyncSentCount.load(), fromRadioSyncRetryCount.load(), fromRadioSyncNotifyFailureCount.load(),
+            legacyReadServedCount.load(), service ? service->getToPhoneQueueSize() : 0,
+            service ? service->getToPhoneQueueMaxObserved() : 0, service ? service->getToPhoneQueueDropCount() : 0,
+            static_cast<unsigned int>(toPhoneQueueSize.load()), static_cast<unsigned int>(toPhoneQueueMaxObserved),
+            toPhoneQueueFullEventCount.load(), router ? router->getFromRadioQueueDropCount() : 0);
+    }
+
+    void maybeForceGattRefreshDisconnect()
+    {
+        if (!gattRefreshDisconnectPending.load() || !bleServer || !isConnected()) {
+            return;
+        }
+
+        const uint32_t now = millis();
+        const uint32_t disconnectAt = gattRefreshDisconnectAtMs.load();
+        if (now < disconnectAt) {
+            return;
+        }
+
+        const uint16_t conn_handle = nimbleBluetoothConnHandle.load();
+        gattRefreshDisconnectPending = false;
+        gattRefreshDisconnectAtMs = 0;
+        if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            LOG_WARN("BLE service-changed reconnect skipped because conn_handle is invalid");
+            return;
+        }
+
+        LOG_WARN("BLE forcing reconnect after service changed conn=%u", conn_handle);
+        bleServer->disconnect(conn_handle);
+    }
+
+    bool runOnceHasWorkToPhoneSync()
+    {
+        return isFromRadioSyncActive() && isConnected() && !fromRadioSyncNotifyInFlight.load() && isFromRadioSyncReadyToSend() &&
+               (hasFromRadioSyncPendingPacket() || toPhoneQueueSize > 0 || available());
+    }
+
+    bool loadFromRadioSyncPendingPacket()
+    {
+        {
+            std::lock_guard<std::mutex> guard(fromRadioSyncMutex);
+            if (fromRadioSyncPendingSize > 0) {
+                return true;
+            }
+        }
+
+        uint8_t fromRadioBytes[meshtastic_FromRadio_size] = {0};
+        size_t numBytes = 0;
+        bool loadedFromLegacyQueue = false;
+        {
+            std::lock_guard<std::mutex> guard(toPhoneMutex);
+            const size_t queuedPackets = toPhoneQueueSize.load();
+            if (queuedPackets > 0) {
+                memcpy(fromRadioBytes, toPhoneQueue[0].data(), toPhoneQueueByteSizes[0]);
+                numBytes = toPhoneQueueByteSizes[0];
+                loadedFromLegacyQueue = true;
+
+                for (uint8_t i = 1; i < queuedPackets; i++) {
+                    memcpy(toPhoneQueue[i - 1].data(), toPhoneQueue[i].data(), toPhoneQueueByteSizes[i]);
+                    toPhoneQueueByteSizes[i - 1] = toPhoneQueueByteSizes[i];
+                }
+
+                if (toPhoneQueueSize > 0) {
+                    toPhoneQueueSize--;
+                }
+            }
+        }
+
+        if (numBytes == 0 && shouldUseLegacyQueueProducerForSync()) {
+            return false;
+        }
+
+        if (numBytes == 0) {
+            numBytes = getFromRadio(fromRadioBytes);
+        }
+        if (numBytes == 0) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(fromRadioSyncMutex);
+            memcpy(fromRadioSyncPending.data(), fromRadioBytes, numBytes);
+            fromRadioSyncPendingSize = numBytes;
+            fromRadioSyncSequence++;
+            LOG_DEBUG("BLE FROMRADIOSYNC queued seq=%u bytes=%u state=%s source=%s", fromRadioSyncSequence,
+                      static_cast<unsigned int>(numBytes), debugStateName(), loadedFromLegacyQueue ? "legacyQ" : "phoneapi");
+        }
+
+        return true;
+    }
+
+    void runOnceHandleToPhoneQueueLegacy()
     {
         // Stack buffer for getFromRadio packet
         uint8_t fromRadioBytes[meshtastic_FromRadio_size] = {0};
@@ -314,6 +413,184 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         }
     }
 
+    bool runOnceHandleToPhoneSync()
+    {
+        if (!runOnceHasWorkToPhoneSync() || !fromRadioSyncCharacteristic) {
+            return false;
+        }
+        if (fromRadioSyncNotifyInFlight.load()) {
+            return false;
+        }
+        if (!loadFromRadioSyncPendingPacket()) {
+            return false;
+        }
+
+        std::array<uint8_t, meshtastic_FromRadio_size> fromRadioBytes = {};
+        size_t numBytes = 0;
+        uint32_t sequence = 0;
+        {
+            std::lock_guard<std::mutex> guard(fromRadioSyncMutex);
+            if (fromRadioSyncPendingSize == 0) {
+                return false;
+            }
+            memcpy(fromRadioBytes.data(), fromRadioSyncPending.data(), fromRadioSyncPendingSize);
+            numBytes = fromRadioSyncPendingSize;
+            sequence = fromRadioSyncSequence;
+            fromRadioSyncNotifyInFlight = true;
+        }
+
+        LOG_DEBUG("BLE FROMRADIOSYNC send seq=%u bytes=%u state=%s", sequence, static_cast<unsigned int>(numBytes),
+                  debugStateName());
+        const uint32_t sendIntervalMs = getFromRadioSyncSendIntervalMs();
+        setFromRadioSyncNextSendDelay(sendIntervalMs);
+        setIntervalFromNow(sendIntervalMs);
+        fromRadioSyncCharacteristic->setValue(fromRadioBytes.data(), numBytes);
+#ifdef NIMBLE_TWO
+        fromRadioSyncCharacteristic->notify(fromRadioBytes.data(), numBytes, BLE_HS_CONN_HANDLE_NONE);
+#else
+        fromRadioSyncCharacteristic->notify(fromRadioBytes.data(), numBytes, true);
+#endif
+        return true;
+    }
+
+    int32_t computeNextRunDelayMs()
+    {
+        if (connectionParamsDirty.load()) {
+            return 0;
+        }
+
+        if (!isFromRadioSyncActive() || !isConnected()) {
+            return INT32_MAX;
+        }
+        if (fromRadioSyncNotifyInFlight.load()) {
+            return INT32_MAX;
+        }
+        if (!(hasFromRadioSyncPendingPacket() || toPhoneQueueSize > 0 || available())) {
+            return INT32_MAX;
+        }
+
+        uint32_t nextSendMs = 0;
+        {
+            std::lock_guard<std::mutex> guard(fromRadioSyncMutex);
+            nextSendMs = fromRadioSyncNextSendMs;
+        }
+
+        const int32_t delayMs = static_cast<int32_t>(nextSendMs - millis());
+        const int32_t boundedDelayMs = delayMs > 0 ? delayMs : 0;
+        LOG_DEBUG("BLE next wake in %d ms syncSub=%d inflight=%d pending=%u state=%s", boundedDelayMs,
+                  isFromRadioSyncActive(), fromRadioSyncNotifyInFlight.load(), hasFromRadioSyncPendingPacket(),
+                  debugStateName());
+        return boundedDelayMs;
+    }
+
+  protected:
+    virtual int32_t runOnce() override
+    {
+        maybeForceGattRefreshDisconnect();
+        applyConnectionParamsIfNeeded();
+        while (runOnceHasWorkToDo()) {
+            if (!checkIsConnected()) {
+                LOG_DEBUG("BLE runOnce stopping because physical link is disconnected");
+                close();
+                break;
+            }
+            /*
+              PROCESS fromPhoneQueue BEFORE toPhoneQueue:
+
+              In normal STATE_SEND_PACKETS operation, it's unlikely that we'll have both writes and reads to process at the same
+              time, because either onWrite or onRead will trigger this runOnce. And in STATE_SEND_PACKETS, it's generally ok to
+              service either the reads or writes first.
+
+              However, during the initial setup wantConfig packet, the clients send a write and immediately send a read, and they
+              expect the read will respond to the write. (This also happens when a client goes from STATE_SEND_PACKETS back to
+              another wantConfig, like the iOS client does when requesting the nodedb after requesting the main config only.)
+
+              So it's safest to always service writes (fromPhoneQueue) before reads (toPhoneQueue), so that any "synchronous"
+              write-then-read sequences from the client work as expected, even if this means we block onRead for a while: this is
+              what the client wants!
+            */
+
+            // PHONE -> RADIO:
+            runOnceHandleFromPhoneQueue(); // pull data from onWrite to handleToRadio
+
+            // RADIO -> PHONE:
+            runOnceHandleToPhoneQueue(); // push data from getFromRadio to onRead
+
+            applyConnectionParamsIfNeeded();
+            maybeForceGattRefreshDisconnect();
+        }
+
+        // the run is triggered via NimbleBluetoothToRadioCallback and NimbleBluetoothFromRadioCallback
+        return computeNextRunDelayMs();
+    }
+
+    virtual void onConfigStart() override
+    {
+        LOG_INFO("BLE onConfigStart");
+        markConnectionParamsDirty();
+    }
+
+    virtual void onConfigComplete() override
+    {
+        LOG_INFO("BLE onConfigComplete");
+        if (isFromRadioSyncSubscribed()) {
+            LOG_INFO("BLE keep high-throughput connection while FROMRADIOSYNC is subscribed");
+        }
+        markConnectionParamsDirty();
+    }
+
+    bool runOnceHasWorkToDo() { return runOnceHasWorkToPhone() || runOnceHasWorkFromPhone(); }
+
+    bool runOnceHasWorkToPhone()
+    {
+        if (isFromRadioSyncActive()) {
+            return runOnceHasWorkToPhoneSync();
+        }
+        return onReadCallbackIsWaitingForData || runOnceToPhoneCanPreloadNextPacket();
+    }
+
+    bool runOnceToPhoneCanPreloadNextPacket()
+    {
+        /*
+         * PRELOADING getFromRadio RESPONSES:
+         *
+         * It's not safe to preload packets if we're in STATE_SEND_PACKETS, because there may be a while between the time we call
+         * getFromRadio and when the client actually reads it. If the connection drops in that time, we might lose that packet
+         * forever. In STATE_SEND_PACKETS, if we wait for onRead before we call getFromRadio, we minimize the time window where
+         * the client might disconnect before completing the read.
+         *
+         * However, if we're in the setup states (sending config, nodeinfo, etc), it's safe and beneficial to preload packets into
+         * toPhoneQueue because the client will just reconnect after a disconnect, losing nothing.
+         */
+
+        if (!isConnected()) {
+            return false;
+        } else if (isSendingPackets()) {
+            // If we're in STATE_SEND_PACKETS, we must wait for onRead before calling getFromRadio.
+            return false;
+        } else {
+            // In other states, we can preload as long as there's space in the toPhoneQueue.
+            return toPhoneQueueSize < NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE;
+        }
+    }
+
+    void runOnceHandleToPhoneQueue()
+    {
+        if (shouldUseLegacyQueueProducerForSync()) {
+            runOnceHandleToPhoneQueueLegacy();
+            runOnceHandleToPhoneSync();
+            return;
+        }
+
+        if (runOnceHandleToPhoneSync()) {
+            return;
+        }
+        if (isFromRadioSyncActive()) {
+            return;
+        }
+        runOnceHandleToPhoneQueueLegacy();
+    }
+
     bool runOnceHasWorkFromPhone() { return fromPhoneQueueSize > 0; }
 
     void runOnceHandleFromPhoneQueue()
@@ -351,6 +628,13 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     virtual void onNowHasData(uint32_t fromRadioNum)
     {
         PhoneAPI::onNowHasData(fromRadioNum);
+
+        if (isFromRadioSyncActive()) {
+            setIntervalFromNow(0);
+            concurrency::mainDelay.interrupt();
+            maybeLogDeliveryStats();
+            return;
+        }
 
 #ifdef DEBUG_NIMBLE_NOTIFY
 
@@ -486,6 +770,55 @@ class NimbleBluetoothToRadioCallback : public NimBLECharacteristicCallbacks
     }
 };
 
+class NimbleBluetoothFromRadioSyncCallback : public NimBLECharacteristicCallbacks
+{
+    void onSubscribe(NimBLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc, uint16_t subValue) override
+    {
+        const bool subscribed = subValue != 0;
+        bluetoothPhoneAPI->fromRadioSyncSubscribed = subscribed;
+        bluetoothPhoneAPI->markConnectionParamsDirty();
+
+        LOG_INFO("BLE FROMRADIOSYNC %s conn=%u addr=%s subValue=%u", subscribed ? "subscribed" : "unsubscribed",
+                 desc ? desc->conn_handle : BLE_HS_CONN_HANDLE_NONE,
+                 desc ? std::string(NimBLEAddress(desc->peer_ota_addr)).c_str() : "unknown", subValue);
+        if (!subscribed) {
+            bluetoothPhoneAPI->fromRadioSyncNotifyInFlight = false;
+            std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->fromRadioSyncMutex);
+            bluetoothPhoneAPI->fromRadioSyncPendingSize = 0;
+            bluetoothPhoneAPI->fromRadioSyncNextSendMs = 0;
+        }
+        bluetoothPhoneAPI->maybeLogDeliveryStats(true);
+    }
+
+    void onStatus(NimBLECharacteristic *pCharacteristic, Status status, int code) override
+    {
+        bluetoothPhoneAPI->fromRadioSyncNotifyInFlight = false;
+        if (status == SUCCESS_NOTIFY || status == SUCCESS_INDICATE) {
+            uint32_t sequence = 0;
+            {
+                std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->fromRadioSyncMutex);
+                sequence = bluetoothPhoneAPI->fromRadioSyncSequence;
+                bluetoothPhoneAPI->fromRadioSyncPendingSize = 0;
+            }
+            bluetoothPhoneAPI->fromRadioSyncSentCount++;
+            LOG_DEBUG("BLE FROMRADIOSYNC sent seq=%u code=%d", sequence, code);
+        } else {
+            bluetoothPhoneAPI->fromRadioSyncNotifyFailureCount++;
+            if (code == BLE_HS_ENOMEM) {
+                bluetoothPhoneAPI->fromRadioSyncRetryCount++;
+            }
+            bluetoothPhoneAPI->setFromRadioSyncNextSendDelay(code == BLE_HS_ENOMEM ? kFromRadioSyncEnomemRetryMs
+                                                                                   : kFromRadioSyncGenericRetryMs);
+            LOG_WARN("BLE FROMRADIOSYNC notify failed status=%d code=%d pending=%u state=%s", status, code,
+                     bluetoothPhoneAPI->hasFromRadioSyncPendingPacket(), bluetoothPhoneAPI->debugStateName());
+            bluetoothPhoneAPI->maybeLogDeliveryStats(true);
+        }
+        bluetoothPhoneAPI->setIntervalFromNow(code == BLE_HS_ENOMEM ? kFromRadioSyncEnomemRetryMs
+                                                                    : bluetoothPhoneAPI->getFromRadioSyncSendIntervalMs());
+        concurrency::mainDelay.interrupt();
+    }
+};
+
 class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
 {
 #ifdef NIMBLE_TWO
@@ -495,6 +828,17 @@ class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
 #endif
     {
         // CAUTION: This callback runs in the NimBLE task!!! Don't do anything except communicate with the main task's runOnce.
+
+        if (bluetoothPhoneAPI->isFromRadioSyncActive()) {
+            static uint32_t syncLegacyReadBypassCount = 0;
+            uint8_t emptyValue = 0;
+            syncLegacyReadBypassCount++;
+            if (syncLegacyReadBypassCount <= 5 || syncLegacyReadBypassCount % 20 == 0) {
+                LOG_DEBUG("BLE onRead bypassed because FROMRADIOSYNC is active count=%u", syncLegacyReadBypassCount);
+            }
+            pCharacteristic->setValue(&emptyValue, 0);
+            return;
+        }
 
         int currentReadCount = bluetoothPhoneAPI->readCount.fetch_add(1);
         int tries = 0;
@@ -589,6 +933,10 @@ class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
 #endif
 
         pCharacteristic->setValue(fromRadioBytes, numBytes);
+        if (numBytes != 0) {
+            bluetoothPhoneAPI->legacyReadServedCount++;
+            bluetoothPhoneAPI->maybeLogDeliveryStats();
+        }
 
         // If we sent something, wake up the main loop if it's sleeping in case there are more packets ready to enqueue.
         if (numBytes != 0) {
@@ -677,6 +1025,17 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 #else
         nimbleBluetoothConnHandle = desc->conn_handle;
 #endif
+
+        if (!gattServiceChangedNotified.exchange(true)) {
+            LOG_WARN("BLE signal service changed to refresh client cache");
+            ble_svc_gatt_changed(0x0001, 0xffff);
+            gattRefreshDisconnectPending = true;
+            gattRefreshDisconnectAtMs = millis() + 750;
+            if (bluetoothPhoneAPI) {
+                bluetoothPhoneAPI->setIntervalFromNow(750);
+                concurrency::mainDelay.interrupt();
+            }
+        }
     }
 
 #ifdef NIMBLE_TWO
@@ -745,7 +1104,23 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
             bluetoothPhoneAPI->readCount = 0;
             bluetoothPhoneAPI->notifyCount = 0;
             bluetoothPhoneAPI->writeCount = 0;
+            bluetoothPhoneAPI->fromRadioSyncSentCount = 0;
+            bluetoothPhoneAPI->fromRadioSyncNotifyFailureCount = 0;
+            bluetoothPhoneAPI->fromRadioSyncRetryCount = 0;
+            bluetoothPhoneAPI->legacyReadServedCount = 0;
+            bluetoothPhoneAPI->fromRadioSyncSubscribed = false;
+            bluetoothPhoneAPI->fromRadioSyncNotifyInFlight = false;
+            bluetoothPhoneAPI->connectionParamsDirty = false;
+            bluetoothPhoneAPI->lastStatsLogMs = 0;
+            {
+                std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->fromRadioSyncMutex);
+                bluetoothPhoneAPI->fromRadioSyncPendingSize = 0;
+                bluetoothPhoneAPI->fromRadioSyncSequence = 0;
+                bluetoothPhoneAPI->fromRadioSyncNextSendMs = 0;
+            }
         }
+        gattRefreshDisconnectPending = false;
+        gattRefreshDisconnectAtMs = 0;
 
         // Clear the last ToRadio packet buffer to avoid rejecting first packet from new connection
         memset(lastToRadio, 0, sizeof(lastToRadio));
@@ -770,6 +1145,7 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 
 static NimbleBluetoothToRadioCallback *toRadioCallbacks;
 static NimbleBluetoothFromRadioCallback *fromRadioCallbacks;
+static NimbleBluetoothFromRadioSyncCallback *fromRadioSyncCallbacks;
 
 void NimbleBluetooth::shutdown()
 {
@@ -899,14 +1275,17 @@ void NimbleBluetooth::setupService()
     NimBLEService *bleService = bleServer->createService(MESH_SERVICE_UUID);
     NimBLECharacteristic *ToRadioCharacteristic;
     NimBLECharacteristic *FromRadioCharacteristic;
+    NimBLECharacteristic *FromRadioSyncCharacteristic;
     // Define the characteristics that the app is looking for
     if (config.bluetooth.mode == meshtastic_Config_BluetoothConfig_PairingMode_NO_PIN) {
         ToRadioCharacteristic = bleService->createCharacteristic(TORADIO_UUID, NIMBLE_PROPERTY::WRITE);
-        // Allow notifications so phones can stream FromRadio without polling.
         FromRadioCharacteristic = bleService->createCharacteristic(FROMRADIO_UUID, NIMBLE_PROPERTY::READ);
         fromNumCharacteristic = bleService->createCharacteristic(FROMNUM_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
         logRadioCharacteristic =
             bleService->createCharacteristic(LOGRADIO_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ, 512U);
+        // Keep legacy characteristic handles stable for Android clients with a stale GATT cache.
+        FromRadioSyncCharacteristic =
+            bleService->createCharacteristic(FROMRADIOSYNC_UUID, NIMBLE_PROPERTY::NOTIFY, meshtastic_FromRadio_size);
     } else {
         ToRadioCharacteristic = bleService->createCharacteristic(
             TORADIO_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_AUTHEN | NIMBLE_PROPERTY::WRITE_ENC);
@@ -918,8 +1297,13 @@ void NimbleBluetooth::setupService()
         logRadioCharacteristic = bleService->createCharacteristic(
             LOGRADIO_UUID,
             NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::READ_ENC, 512U);
+        // Keep legacy characteristic handles stable for Android clients with a stale GATT cache.
+        FromRadioSyncCharacteristic = bleService->createCharacteristic(
+            FROMRADIOSYNC_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::READ_ENC,
+            meshtastic_FromRadio_size);
     }
     bluetoothPhoneAPI = new BluetoothPhoneAPI();
+    fromRadioSyncCharacteristic = FromRadioSyncCharacteristic;
 
     toRadioCallbacks = new NimbleBluetoothToRadioCallback();
     ToRadioCharacteristic->setCallbacks(toRadioCallbacks);
@@ -927,7 +1311,13 @@ void NimbleBluetooth::setupService()
     fromRadioCallbacks = new NimbleBluetoothFromRadioCallback();
     FromRadioCharacteristic->setCallbacks(fromRadioCallbacks);
 
+    fromRadioSyncCallbacks = new NimbleBluetoothFromRadioSyncCallback();
+    FromRadioSyncCharacteristic->setCallbacks(fromRadioSyncCallbacks);
+
     bleService->start();
+    LOG_INFO("BLE handles toradio=%u fromradio=%u fromnum=%u logradio=%u fromradiosync=%u", ToRadioCharacteristic->getHandle(),
+             FromRadioCharacteristic->getHandle(), fromNumCharacteristic->getHandle(), logRadioCharacteristic->getHandle(),
+             FromRadioSyncCharacteristic->getHandle());
 
     // Setup the battery service
     NimBLEService *batteryService = bleServer->createService(NimBLEUUID((uint16_t)0x180f)); // 0x180F is the Battery Service

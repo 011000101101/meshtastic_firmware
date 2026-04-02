@@ -173,6 +173,7 @@ void Router::enqueueReceivedMessage(meshtastic_MeshPacket *p)
         meshtastic_MeshPacket *old_p;
         old_p = fromRadioQueue.dequeuePtr(0); // Dequeue and discard the oldest packet
         if (old_p) {
+            fromRadioQueueDropCount++;
             printPacket("fromRadioQ full, drop oldest!", old_p);
             packetPool.release(old_p);
         }

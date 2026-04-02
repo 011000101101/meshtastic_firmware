@@ -91,6 +91,9 @@ class Router : protected concurrency::OSThread, protected PacketHistory
     /* Statistics for the amount of duplicate received packets and the amount of times we cancel a relay because someone did it
         before us */
     uint32_t rxDupe = 0, txRelayCanceled = 0;
+    uint32_t fromRadioQueueDropCount = 0;
+
+    uint32_t getFromRadioQueueDropCount() const { return fromRadioQueueDropCount; }
 
     // pointer to the encrypted packet
     meshtastic_MeshPacket *p_encrypted = nullptr;

@@ -122,6 +122,9 @@ class MeshService
     /// Return the next packet destined to the phone.  FIXME, somehow use fromNum to allow the phone to retry the
     /// last few packets if needs to.
     meshtastic_MeshPacket *getForPhone() { return toPhoneQueue.dequeuePtr(0); }
+    int getToPhoneQueueSize() { return toPhoneQueue.numUsed(); }
+    uint32_t getToPhoneQueueDropCount() const { return toPhoneQueueDropCount; }
+    int getToPhoneQueueMaxObserved() const { return toPhoneQueueMaxObserved; }
 
     /// Allows the bluetooth handler to free packets after they have been sent
     void releaseToPool(meshtastic_MeshPacket *p) { packetPool.release(p); }

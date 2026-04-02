@@ -46,6 +46,38 @@ PhoneAPI::~PhoneAPI()
     close();
 }
 
+const char *PhoneAPI::debugStateName() const
+{
+    switch (state) {
+    case STATE_SEND_NOTHING:
+        return "STATE_SEND_NOTHING";
+    case STATE_SEND_UIDATA:
+        return "STATE_SEND_UIDATA";
+    case STATE_SEND_MY_INFO:
+        return "STATE_SEND_MY_INFO";
+    case STATE_SEND_OWN_NODEINFO:
+        return "STATE_SEND_OWN_NODEINFO";
+    case STATE_SEND_METADATA:
+        return "STATE_SEND_METADATA";
+    case STATE_SEND_CHANNELS:
+        return "STATE_SEND_CHANNELS";
+    case STATE_SEND_CONFIG:
+        return "STATE_SEND_CONFIG";
+    case STATE_SEND_MODULECONFIG:
+        return "STATE_SEND_MODULECONFIG";
+    case STATE_SEND_OTHER_NODEINFOS:
+        return "STATE_SEND_OTHER_NODEINFOS";
+    case STATE_SEND_FILEMANIFEST:
+        return "STATE_SEND_FILEMANIFEST";
+    case STATE_SEND_COMPLETE_ID:
+        return "STATE_SEND_COMPLETE_ID";
+    case STATE_SEND_PACKETS:
+        return "STATE_SEND_PACKETS";
+    default:
+        return "STATE_UNKNOWN";
+    }
+}
+
 void PhoneAPI::handleStartConfig()
 {
     // Must be before setting state (because state is how we know !connected)
