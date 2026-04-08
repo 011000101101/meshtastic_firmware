@@ -1052,17 +1052,15 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
         } else {
             LOG_WARN("Failed to prefer 2M PHY for conn %u, rc=%d", connHandle, phyResult);
         }
-#endif
-
         int dataLenResult = ble_gap_set_data_len(connHandle, kPreferredBleTxOctets, kPreferredBleTxTimeUs);
         if (dataLenResult == 0) {
             LOG_INFO("BLE conn %u requested data length %u bytes", connHandle, kPreferredBleTxOctets);
         } else {
             LOG_WARN("Failed to raise data length for conn %u, rc=%d", connHandle, dataLenResult);
         }
-
         LOG_INFO("BLE conn %u initial MTU %u (target %u)", connHandle, connInfo.getMTU(), kPreferredBleMtu);
         pServer->updateConnParams(connHandle, 6, 12, 0, 200);
+#endif
     }
 #endif
 
@@ -1229,7 +1227,9 @@ void NimbleBluetooth::setup()
     NimBLEDevice::init(getDeviceName());
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
-#if NIMBLE_ENABLE_2M_PHY && (defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C6))
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C6)
+    // ATT MTU exchange is independent of the BLE 2M PHY. Keep the larger server MTU even
+    // when BLE 5 PHY features are not enabled for this build.
     int mtuResult = NimBLEDevice::setMTU(kPreferredBleMtu);
     if (mtuResult == 0) {
         LOG_INFO("BLE MTU request set to %u", kPreferredBleMtu);
@@ -1237,6 +1237,7 @@ void NimbleBluetooth::setup()
         LOG_WARN("Unable to request MTU %u, rc=%d", kPreferredBleMtu, mtuResult);
     }
 
+#if NIMBLE_ENABLE_2M_PHY
     int phyResult = ble_gap_set_prefered_default_le_phy(BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK);
     if (phyResult == 0) {
         LOG_INFO("BLE default PHY preference set to 2M");
@@ -1251,6 +1252,7 @@ void NimbleBluetooth::setup()
         LOG_WARN("Failed to raise suggested data length (%u/%u), rc=%d", kPreferredBleTxOctets, kPreferredBleTxTimeUs,
                  dataLenResult);
     }
+#endif
 #endif
 
     if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_NO_PIN) {

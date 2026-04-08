@@ -67,11 +67,6 @@ template <class T> class SX126xInterface : public RadioLibInterface
      */
     virtual void configHardwareForSend() override;
 
-    /**
-     * Add SNR data to received messages
-     */
-    virtual void addReceiveMetadata(meshtastic_MeshPacket *mp) override;
-
     virtual void setStandby() override;
 
     uint32_t getPacketTime(uint32_t pl, bool received) override { return computePacketTime(lora, pl, received); }

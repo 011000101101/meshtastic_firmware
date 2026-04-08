@@ -197,7 +197,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     void startTransmitTimerRebroadcast(meshtastic_MeshPacket *p);
 
     void handleTransmitInterrupt();
-    void handleReceiveInterrupt();
+    bool handleReceiveInterrupt();
 
     static void timerCallback(void *p1, uint32_t p2);
 
@@ -212,6 +212,11 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     meshtastic_QueueStatus getQueueStatus();
 
   protected:
+    struct ReceiveMetadata {
+        float snr = 0.0f;
+        int32_t rssi = 0;
+    };
+
     uint32_t activeReceiveStart = 0;
 
     bool receiveDetected(uint16_t irq, ulong syncWordHeaderValidFlag, ulong preambleDetectedFlag);
@@ -233,9 +238,9 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     void completeSending();
 
     /**
-     * Add SNR data to received messages
+     * Snapshot packet-latched metadata before receive is re-armed.
      */
-    virtual void addReceiveMetadata(meshtastic_MeshPacket *mp) = 0;
+    ReceiveMetadata captureReceiveMetadata();
 
     /**
      * Subclasses must override, implement and then call into this base class implementation

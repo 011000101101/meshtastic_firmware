@@ -262,8 +262,8 @@ void RadioLibInterface::onNotify(uint32_t notification)
         setTransmitDelay();
         break;
     case ISR_RX:
-        handleReceiveInterrupt();
-        startReceive();
+        if (!handleReceiveInterrupt())
+            startReceive();
         setTransmitDelay();
         break;
     case TRANSMIT_DELAY_COMPLETED:
@@ -422,13 +422,13 @@ void RadioLibInterface::completeSending()
     }
 }
 
-void RadioLibInterface::handleReceiveInterrupt()
+bool RadioLibInterface::handleReceiveInterrupt()
 {
     // when this is called, we should be in receive mode - if we are not, just jump out instead of bombing. Possible Race
     // Condition?
     if (!isReceiving) {
         LOG_ERROR("handleReceiveInterrupt called when not in rx mode, which shouldn't happen");
-        return;
+        return false;
     }
 
     isReceiving = false;
@@ -442,7 +442,7 @@ void RadioLibInterface::handleReceiveInterrupt()
     if (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
         LOG_WARN("lora rx disabled: Region unset");
         airTime->logAirtime(RX_ALL_LOG, rxMsec);
-        return;
+        return false;
     }
 #endif
 
@@ -463,6 +463,10 @@ void RadioLibInterface::handleReceiveInterrupt()
         airTime->logAirtime(RX_ALL_LOG, rxMsec);
 
     } else {
+        ReceiveMetadata metadata = captureReceiveMetadata();
+        // Re-arm RX before any packet allocation, logging, or routing work so burst traffic is not missed while software runs.
+        startReceive();
+
         // Skip the 4 headers that are at the beginning of the rxBuf
         int32_t payloadLen = length - sizeof(PacketHeader);
 
@@ -476,7 +480,7 @@ void RadioLibInterface::handleReceiveInterrupt()
             // altered packet with "from == 0" can do Remote Node Administration without permission
             if (radioBuffer.header.from == 0) {
                 LOG_WARN("Ignore received packet without sender");
-                return;
+                return true;
             }
 
             // Note: we deliver _all_ packets to our router (i.e. our interface is intentionally promiscuous).
@@ -497,8 +501,8 @@ void RadioLibInterface::handleReceiveInterrupt()
             // If hop_start is not set, next_hop and relay_node are invalid (firmware <2.3)
             mp->next_hop = mp->hop_start == 0 ? NO_NEXT_HOP_PREFERENCE : radioBuffer.header.next_hop;
             mp->relay_node = mp->hop_start == 0 ? NO_RELAY_NODE : radioBuffer.header.relay_node;
-
-            addReceiveMetadata(mp);
+            mp->rx_snr = metadata.snr;
+            mp->rx_rssi = metadata.rssi;
 
             mp->which_payload_variant =
                 meshtastic_MeshPacket_encrypted_tag; // Mark that the payload is still encrypted at this point
@@ -506,19 +510,27 @@ void RadioLibInterface::handleReceiveInterrupt()
             memcpy(mp->encrypted.bytes, radioBuffer.payload, payloadLen);
             mp->encrypted.size = payloadLen;
 
-            printPacket("Lora RX", mp);
-
             airTime->logAirtime(RX_LOG, rxMsec);
 
             deliverToReceiver(mp);
         }
     }
+
+    return state == RADIOLIB_ERR_NONE;
 }
 
 void RadioLibInterface::startReceive()
 {
     isReceiving = true;
     powerMon->setState(meshtastic_PowerMon_State_Lora_RXOn);
+}
+
+RadioLibInterface::ReceiveMetadata RadioLibInterface::captureReceiveMetadata()
+{
+    ReceiveMetadata metadata;
+    metadata.snr = iface->getSNR();
+    metadata.rssi = lround(iface->getRSSI());
+    return metadata;
 }
 
 void RadioLibInterface::pollMissedIrqs()

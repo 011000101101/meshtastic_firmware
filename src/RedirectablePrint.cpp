@@ -324,9 +324,11 @@ void RedirectablePrint::log(const char *logLevel, const char *format, ...)
 
         va_start(arg, format);
 
+        #ifndef MESHTASTIC_DISABLE_SERIAL_LOG_OUTPUT
         va_copy(arg_copy, arg);
         log_to_serial(logLevel, newFormat.get(), arg_copy);
         va_end(arg_copy);
+        #endif
 
         va_copy(arg_copy, arg);
         log_to_syslog(logLevel, newFormat.get(), arg_copy);

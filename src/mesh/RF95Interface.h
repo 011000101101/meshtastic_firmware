@@ -53,11 +53,6 @@ class RF95Interface : public RadioLibInterface
      */
     virtual void startReceive() override;
 
-    /**
-     * Add SNR data to received messages
-     */
-    virtual void addReceiveMetadata(meshtastic_MeshPacket *mp) override;
-
     virtual void setStandby() override;
 
     /**

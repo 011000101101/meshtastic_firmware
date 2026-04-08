@@ -221,17 +221,6 @@ template <typename T> void LR11x0Interface<T>::setStandby()
     RadioLibInterface::setStandby();
 }
 
-/**
- * Add SNR data to received messages
- */
-template <typename T> void LR11x0Interface<T>::addReceiveMetadata(meshtastic_MeshPacket *mp)
-{
-    // LOG_DEBUG("PacketStatus %x", lora.getPacketStatus());
-    mp->rx_snr = lora.getSNR();
-    mp->rx_rssi = lround(lora.getRSSI());
-    LOG_DEBUG("Corrected frequency offset: %f", lora.getFrequencyError());
-}
-
 /** We override to turn on transmitter power as needed.
  */
 template <typename T> void LR11x0Interface<T>::configHardwareForSend()
