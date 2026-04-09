@@ -28,8 +28,6 @@
 #include "nimble/nimble/host/include/host/ble_gap.h"
 #endif
 
-extern "C" void ble_svc_gatt_changed(uint16_t start_handle, uint16_t end_handle);
-
 namespace
 {
 constexpr uint32_t kFromRadioSyncMinSendIntervalMs = 12;
@@ -65,10 +63,6 @@ NimBLECharacteristic *fromRadioSyncCharacteristic;
 NimBLECharacteristic *BatteryCharacteristic;
 NimBLECharacteristic *logRadioCharacteristic;
 NimBLEServer *bleServer;
-static std::atomic<bool> gattServiceChangedNotified{false};
-static std::atomic<bool> gattRefreshDisconnectPending{false};
-static std::atomic<uint32_t> gattRefreshDisconnectAtMs{0};
-
 static bool passkeyShowing;
 static std::atomic<uint16_t> nimbleBluetoothConnHandle{BLE_HS_CONN_HANDLE_NONE}; // BLE_HS_CONN_HANDLE_NONE means "no connection"
 
@@ -277,30 +271,6 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
             toPhoneQueueFullEventCount.load(), router ? router->getFromRadioQueueDropCount() : 0);
     }
 
-    void maybeForceGattRefreshDisconnect()
-    {
-        if (!gattRefreshDisconnectPending.load() || !bleServer || !isConnected()) {
-            return;
-        }
-
-        const uint32_t now = millis();
-        const uint32_t disconnectAt = gattRefreshDisconnectAtMs.load();
-        if (now < disconnectAt) {
-            return;
-        }
-
-        const uint16_t conn_handle = nimbleBluetoothConnHandle.load();
-        gattRefreshDisconnectPending = false;
-        gattRefreshDisconnectAtMs = 0;
-        if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-            LOG_WARN("BLE service-changed reconnect skipped because conn_handle is invalid");
-            return;
-        }
-
-        LOG_WARN("BLE forcing reconnect after service changed conn=%u", conn_handle);
-        bleServer->disconnect(conn_handle);
-    }
-
     bool runOnceHasWorkToPhoneSync()
     {
         return isFromRadioSyncActive() && isConnected() && !fromRadioSyncNotifyInFlight.load() && isFromRadioSyncReadyToSend() &&
@@ -486,7 +456,6 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
   protected:
     virtual int32_t runOnce() override
     {
-        maybeForceGattRefreshDisconnect();
         applyConnectionParamsIfNeeded();
         while (runOnceHasWorkToDo()) {
             if (!checkIsConnected()) {
@@ -517,7 +486,6 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
             runOnceHandleToPhoneQueue(); // push data from getFromRadio to onRead
 
             applyConnectionParamsIfNeeded();
-            maybeForceGattRefreshDisconnect();
         }
 
         // the run is triggered via NimbleBluetoothToRadioCallback and NimbleBluetoothFromRadioCallback
@@ -1068,16 +1036,6 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
         nimbleBluetoothConnHandle = desc->conn_handle;
 #endif
 
-        if (!gattServiceChangedNotified.exchange(true)) {
-            LOG_WARN("BLE signal service changed to refresh client cache");
-            ble_svc_gatt_changed(0x0001, 0xffff);
-            gattRefreshDisconnectPending = true;
-            gattRefreshDisconnectAtMs = millis() + 750;
-            if (bluetoothPhoneAPI) {
-                bluetoothPhoneAPI->setIntervalFromNow(750);
-                concurrency::mainDelay.interrupt();
-            }
-        }
     }
 
 #ifdef NIMBLE_TWO
@@ -1165,9 +1123,6 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
                 bluetoothPhoneAPI->fromRadioSyncNextSendMs = 0;
             }
         }
-        gattRefreshDisconnectPending = false;
-        gattRefreshDisconnectAtMs = 0;
-
         // Clear the last ToRadio packet buffer to avoid rejecting first packet from new connection
         memset(lastToRadio, 0, sizeof(lastToRadio));
 
