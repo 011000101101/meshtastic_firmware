@@ -683,7 +683,7 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         setup. Not worth adjusting much.
         */
         LOG_INFO("BLE requestHighThroughputConnection");
-        bleServer->updateConnParams(conn_handle, 6, 12, 0, 600);
+        requestConnectionParams(conn_handle, 6, 12, 0, 600, "high-throughput");
     }
 
     void requestLowerPowerConnection(uint16_t conn_handle)
@@ -706,7 +706,49 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         per second.
         */
         LOG_INFO("BLE requestLowerPowerConnection");
-        bleServer->updateConnParams(conn_handle, 24, 40, 2, 600);
+        requestConnectionParams(conn_handle, 24, 40, 2, 600, "lower-power");
+    }
+
+    bool requestConnectionParams(uint16_t conn_handle, uint16_t minInterval, uint16_t maxInterval, uint16_t latency,
+                                 uint16_t timeout, const char *profileName)
+    {
+        if (!bleServer || !isConnected() || conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            return false;
+        }
+
+        ble_gap_conn_desc desc = {};
+        int findRc = ble_gap_conn_find(conn_handle, &desc);
+        if (findRc != 0) {
+            // Racy disconnects can invalidate the handle between callbacks.
+            if (findRc == BLE_HS_ENOTCONN || findRc == (BLE_HS_ERR_HCI_BASE + BLE_ERR_UNK_CONN_ID)) {
+                LOG_DEBUG("BLE updateConnParams skip (%s), stale conn handle=%u rc=%d", profileName, conn_handle, findRc);
+                return false;
+            }
+            LOG_WARN("BLE updateConnParams skip (%s), conn lookup failed handle=%u rc=%d", profileName, conn_handle, findRc);
+            return false;
+        }
+
+        ble_gap_upd_params params = {};
+        params.latency = latency;
+        params.itvl_max = maxInterval;
+        params.itvl_min = minInterval;
+        params.supervision_timeout = timeout;
+        params.min_ce_len = BLE_GAP_INITIAL_CONN_MIN_CE_LEN;
+        params.max_ce_len = BLE_GAP_INITIAL_CONN_MAX_CE_LEN;
+
+        const int rc = ble_gap_update_params(conn_handle, &params);
+        if (rc == 0) {
+            return true;
+        }
+
+        // 0x0202 = Unknown Connection Identifier. Treat as benign race.
+        if (rc == (BLE_HS_ERR_HCI_BASE + BLE_ERR_UNK_CONN_ID)) {
+            LOG_DEBUG("BLE updateConnParams ignored stale handle=%u rc=%d profile=%s", conn_handle, rc, profileName);
+            return false;
+        }
+
+        LOG_WARN("BLE updateConnParams failed handle=%u rc=%d profile=%s", conn_handle, rc, profileName);
+        return false;
     }
 };
 
@@ -1041,6 +1083,7 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 #ifdef NIMBLE_TWO
     virtual void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo)
     {
+        (void)pServer;
         LOG_INFO("BLE incoming connection %s", connInfo.getAddress().toString().c_str());
 
         const uint16_t connHandle = connInfo.getConnHandle();
@@ -1059,8 +1102,13 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
             LOG_WARN("Failed to raise data length for conn %u, rc=%d", connHandle, dataLenResult);
         }
         LOG_INFO("BLE conn %u initial MTU %u (target %u)", connHandle, connInfo.getMTU(), kPreferredBleMtu);
-        pServer->updateConnParams(connHandle, 6, 12, 0, 200);
 #endif
+        if (bluetoothPhoneAPI) {
+            bluetoothPhoneAPI->markConnectionParamsDirty();
+            // Defer the first param update slightly to avoid racing a just-torn-down handle.
+            bluetoothPhoneAPI->setIntervalFromNow(250);
+            concurrency::mainDelay.interrupt();
+        }
     }
 #endif
 
@@ -1268,6 +1316,9 @@ void NimbleBluetooth::setup()
     NimbleBluetoothServerCallback *serverCallbacks = new NimbleBluetoothServerCallback();
 #endif
     bleServer->setCallbacks(serverCallbacks, true);
+    // NimBLEServer auto-restarts advertising on disconnect by default. We restart explicitly
+    // in our callback to keep behavior consistent across NimBLE modes and avoid double-start races.
+    bleServer->advertiseOnDisconnect(false);
     setupService();
     startAdvertising();
 }
